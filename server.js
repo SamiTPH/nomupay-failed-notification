@@ -1,17 +1,12 @@
 import express from "express";
-import jwt from "jsonwebtoken";
 import nodemailer from "nodemailer";
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Use the raw request body exactly as received.
-// NomuPay signature verification depends on the original payload bytes.
-app.use(
-  express.raw({
-    type: "application/json"
-  })
-);
+// Accept JSON and plain text
+app.use(express.json({ limit: "2mb" }));
+app.use(express.text({ type: "*/*", limit: "2mb" }));
 
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -23,122 +18,67 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// First version dedupe store.
-// Good enough for testing, but not persistent across restarts.
-const seenNotifications = new Set();
-
-function verifyDetachedJws(detachedToken, rawBodyBuffer, sharedKey) {
-  const body = rawBodyBuffer.toString("utf8");
-  const parts = detachedToken.split("..");
-
-  if (parts.length !== 2) {
-    throw new Error("Invalid detached JWS format");
-  }
-
-  const payload = Buffer.from(body, "utf8").toString("base64url");
-  const reconstructedJws = `${parts[0]}.${payload}.${parts[1]}`;
-
-  return jwt.verify(reconstructedJws, sharedKey, {
-    algorithms: ["HS256"]
-  });
-}
-
-function extractInfo(payload) {
-  return {
-    notificationId:
-      payload?.notificationId ||
-      payload?.id ||
-      payload?.eventId ||
-      payload?.reference ||
-      null,
-    status: payload?.status || payload?.payment?.status || null,
-    paymentId: payload?.paymentId || payload?.payment?.id || null,
-    merchantReference:
-      payload?.merchantReference ||
-      payload?.merchantPaymentReference ||
-      payload?.payment?.merchantReference ||
-      null,
-    amount:
-      payload?.amount?.value ||
-      payload?.payment?.amount?.value ||
-      payload?.amount ||
-      null,
-    currency:
-      payload?.amount?.currency ||
-      payload?.payment?.amount?.currency ||
-      payload?.currency ||
-      null,
-    reasonCode:
-      payload?.reason?.code || payload?.payment?.reason?.code || null,
-    reasonDescription:
-      payload?.reason?.description ||
-      payload?.payment?.reason?.description ||
-      null
-  };
-}
-
 app.get("/", (_req, res) => {
   res.status(200).send("NomuPay webhook listener is running");
 });
 
 app.post("/webhooks/nomupay", async (req, res) => {
   try {
-    const rawBody = req.body;
-    const signatureHeader = req.headers["x-signature"];
-    const sharedKey = process.env.WEBHOOK_SHARED_KEY;
+    const body = typeof req.body === "string" ? req.body : JSON.stringify(req.body);
 
-    if (!sharedKey) {
-      return res.status(500).send("Missing WEBHOOK_SHARED_KEY");
-    }
+    console.log("=== NOMUPAY WEBHOOK RECEIVED ===");
+    console.log("Headers:", JSON.stringify(req.headers, null, 2));
+    console.log("Body:", body);
 
-    if (!signatureHeader) {
-      return res.status(401).send("Missing X-Signature");
-    }
-
-    const detachedToken = Array.isArray(signatureHeader)
-      ? signatureHeader[0]
-      : signatureHeader;
-
-    verifyDetachedJws(detachedToken, rawBody, sharedKey);
-
-    const payload = JSON.parse(rawBody.toString("utf8"));
-    const info = extractInfo(payload);
-
-    const dedupeKey =
-      info.notificationId ||
-      `${info.paymentId || "unknown"}:${info.status || "unknown"}:${info.reasonCode || "none"}`;
-
-    if (seenNotifications.has(dedupeKey)) {
-      return res.status(200).send("Duplicate ignored");
-    }
-
-    seenNotifications.add(dedupeKey);
-
-    if (info.status === "failed") {
-      await transporter.sendMail({
-        from: process.env.ALERT_EMAIL_FROM,
-        to: process.env.ALERT_EMAIL_TO,
-        subject: `NomuPay payment failed${info.paymentId ? ` - ${info.paymentId}` : ""}`,
-        text: [
-          "A NomuPay transaction failed.",
-          "",
-          `Status: ${info.status || ""}`,
-          `Payment ID: ${info.paymentId || ""}`,
-          `Merchant Reference: ${info.merchantReference || ""}`,
-          `Amount: ${info.amount || ""} ${info.currency || ""}`.trim(),
-          `Reason Code: ${info.reasonCode || ""}`,
-          `Reason Description: ${info.reasonDescription || ""}`,
-          "",
-          "Raw payload:",
-          JSON.stringify(payload, null, 2)
-        ].join("\n")
-      });
-    }
-
+    // Always acknowledge first so NomuPay sees success
     res.status(200).send("OK");
+
+    // Optional: if payload is already JSON and clearly indicates a failed payment,
+    // send yourself an email. Safe to leave this in.
+    try {
+      const payload = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+      const resultCode = payload?.payload?.result?.code || payload?.result?.code || "";
+      const resultDescription =
+        payload?.payload?.result?.description ||
+        payload?.result?.description ||
+        "";
+
+      const paymentId = payload?.payload?.id || payload?.id || "";
+      const amount = payload?.payload?.amount || payload?.amount || "";
+      const currency = payload?.payload?.currency || payload?.currency || "";
+
+      // OPPWA / Total Processing style success codes usually start with 000.
+      const looksFailed = resultCode && !String(resultCode).startsWith("000.");
+
+      if (looksFailed && process.env.ALERT_EMAIL_TO) {
+        await transporter.sendMail({
+          from: process.env.ALERT_EMAIL_FROM,
+          to: process.env.ALERT_EMAIL_TO,
+          subject: `NomuPay payment alert - ${paymentId || "unknown payment"}`,
+          text: [
+            "A NomuPay webhook was received that appears to be a failed or non-success payment.",
+            "",
+            `Payment ID: ${paymentId}`,
+            `Amount: ${amount} ${currency}`.trim(),
+            `Result Code: ${resultCode}`,
+            `Result Description: ${resultDescription}`,
+            "",
+            "Payload:",
+            JSON.stringify(payload, null, 2)
+          ].join("\n")
+        });
+      }
+    } catch (e) {
+      console.log("Webhook body is not directly parseable JSON yet:", e.message);
+    }
   } catch (error) {
-    console.error("Webhook error:", error.message);
-    res.status(400).send("Invalid webhook");
+    console.error("Webhook handling error:", error.message);
+
+    // Still return 200 for endpoint validation/testing
+    if (!res.headersSent) {
+      res.status(200).send("OK");
+    }
   }
 });
 

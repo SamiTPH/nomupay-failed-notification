@@ -49,13 +49,26 @@ const seen = new Set();
 /*
 DECRYPT PAYLOAD
 */
-function decryptHexPayload(encryptedHex, secretHex, ivHex) {
+function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
 
   const key = Buffer.from(secretHex, "hex");
   const iv = Buffer.from(ivHex, "hex");
   const encrypted = Buffer.from(encryptedHex, "hex");
+  const authTag = Buffer.from(authTagHex, "hex");
 
-  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  console.log("Crypto debug:");
+  console.log("Key length:", key.length);
+  console.log("IV length:", iv.length);
+  console.log("AuthTag length:", authTag.length);
+
+  const decipher = crypto.createDecipheriv(
+    "aes-256-gcm",
+    key,
+    iv,
+    { authTagLength: 16 }
+  );
+
+  decipher.setAuthTag(authTag);
 
   const decrypted = Buffer.concat([
     decipher.update(encrypted),
@@ -64,7 +77,6 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex) {
 
   return decrypted.toString("utf8");
 }
-
 /*
 PARSE WEBHOOK
 */

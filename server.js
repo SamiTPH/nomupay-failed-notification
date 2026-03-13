@@ -5,10 +5,12 @@ import nodemailer from "nodemailer";
 const app = express();
 const port = process.env.PORT || 3000;
 
-// OPPWA / Total Processing webhook payloads may arrive as JSON wrapper or plain text.
-// Using text lets us handle both.
+// Accept raw text payloads (NomuPay may send encrypted hex)
 app.use(express.text({ type: "*/*", limit: "2mb" }));
 
+/*
+SMTP EMAIL TRANSPORT
+*/
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 587),
@@ -19,16 +21,21 @@ const transporter = nodemailer.createTransport({
   }
 });
 
-// First version: in-memory dedupe.
-// Good enough for initial testing, later move to Postgres/Redis.
+/*
+DEDUPLICATION (memory)
+*/
 const seen = new Set();
 
+/*
+AES DECRYPTION (NomuPay encrypted payloads)
+*/
 function decryptHexPayload(encryptedHex, secretHex, ivHex) {
   const key = Buffer.from(secretHex, "hex");
   const iv = Buffer.from(ivHex, "hex");
   const encrypted = Buffer.from(encryptedHex, "hex");
 
   const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+
   const decrypted = Buffer.concat([
     decipher.update(encrypted),
     decipher.final()
@@ -37,29 +44,27 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex) {
   return decrypted.toString("utf8");
 }
 
+/*
+PARSE INCOMING WEBHOOK
+Handles:
+- JSON payload
+- encrypted payload wrapper
+- raw encrypted payload
+*/
 function parseIncomingWebhook(rawBody, headers) {
-  // Two documented wrapper styles:
-  // 1) JSON wrapper
-  // 2) None (plain hex string)
-  //
-  // We handle both. If your exact account format differs slightly,
-  // Railway logs will show what to adjust.
 
   let bodyText = rawBody;
 
   try {
+
     const parsed = JSON.parse(bodyText);
 
-    // Expected JSON wrapper case:
-    // {
-    //   "payload": "<encrypted hex or decrypted object>",
-    //   ...
-    // }
     if (typeof parsed.payload === "object" && parsed.payload !== null) {
-      return parsed; // already usable JSON
+      return parsed;
     }
 
     if (typeof parsed.payload === "string") {
+
       const ivHex =
         headers["x-initialization-vector"] ||
         headers["initialization-vector"] ||
@@ -67,7 +72,7 @@ function parseIncomingWebhook(rawBody, headers) {
         parsed.iv;
 
       if (!ivHex) {
-        throw new Error("Missing initialization vector for encrypted JSON wrapper");
+        throw new Error("Missing initialization vector");
       }
 
       const decrypted = decryptHexPayload(
@@ -80,14 +85,15 @@ function parseIncomingWebhook(rawBody, headers) {
     }
 
     return parsed;
+
   } catch {
-    // Wrapper "None" case: raw body itself is encrypted hex string
+
     const ivHex =
       headers["x-initialization-vector"] ||
       headers["initialization-vector"];
 
     if (!ivHex) {
-      throw new Error("Missing initialization vector for raw encrypted payload");
+      throw new Error("Missing IV for encrypted payload");
     }
 
     const decrypted = decryptHexPayload(
@@ -100,34 +106,53 @@ function parseIncomingWebhook(rawBody, headers) {
   }
 }
 
+/*
+SUCCESS RESULT CHECK
+*/
 function isSuccessResult(code) {
-  // The example success result in the docs is 000.000.000.
-  // Start by treating codes starting with 000. as success.
   return typeof code === "string" && code.startsWith("000.");
 }
 
+/*
+HEALTH CHECK
+*/
 app.get("/", (_req, res) => {
-  res.status(200).send("NomuPay webhook listener is running");
+  res.status(200).send("NomuPay webhook listener running");
 });
 
+/*
+WEBHOOK ENDPOINT
+*/
 app.post("/webhooks/nomupay", async (req, res) => {
+
   const rawBody = req.body;
+
   const headers = Object.fromEntries(
-    Object.entries(req.headers).map(([k, v]) => [k.toLowerCase(), Array.isArray(v) ? v[0] : v])
+    Object.entries(req.headers).map(([k, v]) => [
+      k.toLowerCase(),
+      Array.isArray(v) ? v[0] : v
+    ])
   );
 
-  // Always acknowledge quickly to avoid retries/timeouts.
+  // Respond immediately so NomuPay doesn't retry
   res.status(200).send("OK");
 
   try {
+
     if (!process.env.WEBHOOK_SECRET_HEX) {
       console.error("Missing WEBHOOK_SECRET_HEX");
       return;
     }
 
+    console.log("=== RAW WEBHOOK BODY ===");
+    console.log(rawBody);
+
+    console.log("=== WEBHOOK HEADERS ===");
+    console.log(headers);
+
     const webhook = parseIncomingWebhook(rawBody, headers);
 
-    console.log("=== DECRYPTED NOMUPAY WEBHOOK ===");
+    console.log("=== DECRYPTED WEBHOOK ===");
     console.log(JSON.stringify(webhook, null, 2));
 
     if (webhook?.type !== "PAYMENT" || !webhook?.payload) {
@@ -135,6 +160,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
     }
 
     const payment = webhook.payload;
+
     const paymentId = payment.id || "unknown";
     const resultCode = payment.result?.code || "";
     const resultDescription = payment.result?.description || "";
@@ -142,12 +168,21 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const currency = payment.currency || "";
 
     const dedupeKey = `${paymentId}:${resultCode}`;
+
     if (seen.has(dedupeKey)) {
+      console.log("Duplicate webhook ignored:", dedupeKey);
       return;
     }
+
     seen.add(dedupeKey);
 
+    /*
+    SEND EMAIL IF PAYMENT FAILED
+    */
     if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
+
+      console.log("Payment failure detected → sending email");
+
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
@@ -160,18 +195,30 @@ app.post("/webhooks/nomupay", async (req, res) => {
           `Result Code: ${resultCode}`,
           `Result Description: ${resultDescription}`,
           "",
-          "Webhook:",
+          "Full Webhook:",
           JSON.stringify(webhook, null, 2)
         ].join("\n")
       });
+
+      console.log("Email sent successfully");
+
+    } else {
+      console.log("Payment success or email disabled");
     }
+
   } catch (error) {
+
     console.error("Webhook processing error:", error.message);
     console.error("Raw body:", rawBody);
     console.error("Headers:", headers);
+
   }
+
 });
 
+/*
+START SERVER
+*/
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });

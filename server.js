@@ -2,27 +2,16 @@ import express from "express";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
 
-const APP_VERSION = "1.1.0"; // NEW: version marker to force git change
-
 const app = express();
 const port = process.env.PORT || 3000;
 
-console.log("Starting NomuPay webhook service v" + APP_VERSION);
+console.log("Starting NomuPay webhook listener");
 
-// Accept raw body
-app.use(express.text({ type: "*/*", limit: "2mb" }));
-
-/*
-ENVIRONMENT CHECK
-*/
-console.log("Environment variables check:");
-console.log("SMTP_HOST:", process.env.SMTP_HOST ? "OK" : "MISSING");
-console.log("SMTP_USER:", process.env.SMTP_USER ? "OK" : "MISSING");
-console.log("ALERT_EMAIL_TO:", process.env.ALERT_EMAIL_TO ? "OK" : "MISSING");
-console.log("WEBHOOK_SECRET_HEX:", process.env.WEBHOOK_SECRET_HEX ? "OK" : "MISSING");
+// accept encrypted hex body
+app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
-SMTP CONFIGURATION
+EMAIL SETUP
 */
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -35,19 +24,12 @@ const transporter = nodemailer.createTransport({
 });
 
 /*
-VERIFY SMTP CONNECTION
-*/
-transporter.verify()
-  .then(() => console.log("SMTP connection successful"))
-  .catch(err => console.error("SMTP connection failed:", err.message));
-
-/*
-IN MEMORY DEDUPE
+DEDUPLICATION
 */
 const seen = new Set();
 
 /*
-DECRYPT PAYLOAD
+AES-256-GCM DECRYPTION
 */
 function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
 
@@ -56,17 +38,7 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
   const encrypted = Buffer.from(encryptedHex, "hex");
   const authTag = Buffer.from(authTagHex, "hex");
 
-  console.log("Crypto debug:");
-  console.log("Key length:", key.length);
-  console.log("IV length:", iv.length);
-  console.log("AuthTag length:", authTag.length);
-
-  const decipher = crypto.createDecipheriv(
-    "aes-256-gcm",
-    key,
-    iv,
-    { authTagLength: 16 }
-  );
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
 
   decipher.setAuthTag(authTag);
 
@@ -77,64 +49,9 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
 
   return decrypted.toString("utf8");
 }
-/*
-PARSE WEBHOOK
-*/
-function parseIncomingWebhook(rawBody, headers) {
-
-  try {
-
-    const parsed = JSON.parse(rawBody);
-
-    if (typeof parsed.payload === "object") {
-      return parsed;
-    }
-
-    if (typeof parsed.payload === "string") {
-
-      const ivHex =
-        headers["x-initialization-vector"] ||
-        headers["initialization-vector"] ||
-        parsed.initializationVector ||
-        parsed.iv;
-
-      if (!ivHex) {
-        throw new Error("Missing initialization vector");
-      }
-
-      const decrypted = decryptHexPayload(
-        parsed.payload,
-        process.env.WEBHOOK_SECRET_HEX,
-        ivHex
-      );
-
-      return JSON.parse(decrypted);
-    }
-
-    return parsed;
-
-  } catch {
-
-    const ivHex =
-      headers["x-initialization-vector"] ||
-      headers["initialization-vector"];
-
-    if (!ivHex) {
-      throw new Error("Missing IV for encrypted payload");
-    }
-
-    const decrypted = decryptHexPayload(
-      rawBody.trim(),
-      process.env.WEBHOOK_SECRET_HEX,
-      ivHex
-    );
-
-    return JSON.parse(decrypted);
-  }
-}
 
 /*
-CHECK SUCCESS RESULT
+SUCCESS CHECK
 */
 function isSuccessResult(code) {
   return typeof code === "string" && code.startsWith("000.");
@@ -144,7 +61,7 @@ function isSuccessResult(code) {
 HEALTH CHECK
 */
 app.get("/", (_req, res) => {
-  res.status(200).send(`NomuPay webhook listener running v${APP_VERSION}`);
+  res.status(200).send("NomuPay webhook service running");
 });
 
 /*
@@ -161,24 +78,37 @@ app.post("/webhooks/nomupay", async (req, res) => {
     ])
   );
 
+  // acknowledge immediately
   res.status(200).send("OK");
 
   try {
 
     if (!process.env.WEBHOOK_SECRET_HEX) {
-      console.error("WEBHOOK_SECRET_HEX not configured");
+      console.error("Missing WEBHOOK_SECRET_HEX");
       return;
     }
 
-    console.log("Incoming NomuPay webhook received");
+    const ivHex = headers["x-initialization-vector"];
+    const authTagHex = headers["x-authentication-tag"];
 
-    const webhook = parseIncomingWebhook(rawBody, headers);
+    if (!ivHex || !authTagHex) {
+      console.error("Missing encryption headers");
+      return;
+    }
 
-    console.log("Decrypted webhook payload:");
+    const decrypted = decryptHexPayload(
+      rawBody.trim(),
+      process.env.WEBHOOK_SECRET_HEX,
+      ivHex,
+      authTagHex
+    );
+
+    const webhook = JSON.parse(decrypted);
+
+    console.log("=== DECRYPTED NOMUPAY WEBHOOK ===");
     console.log(JSON.stringify(webhook, null, 2));
 
     if (webhook?.type !== "PAYMENT" || !webhook?.payload) {
-      console.log("Webhook ignored (not payment event)");
       return;
     }
 
@@ -193,44 +123,46 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const dedupeKey = `${paymentId}:${resultCode}`;
 
     if (seen.has(dedupeKey)) {
-      console.log("Duplicate webhook skipped:", dedupeKey);
+      console.log("Duplicate webhook ignored:", dedupeKey);
       return;
     }
 
     seen.add(dedupeKey);
 
+    /*
+    EMAIL ALERT ON FAILURE
+    */
     if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
 
-      console.log("Payment failure detected, sending alert email");
+      console.log("Payment failure detected → sending email");
 
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
         subject: `NomuPay payment failed - ${paymentId}`,
-        text: `
-Payment failure detected.
-
-Payment ID: ${paymentId}
-Amount: ${amount} ${currency}
-Result Code: ${resultCode}
-Description: ${resultDescription}
-
-Webhook Payload:
-${JSON.stringify(webhook, null, 2)}
-`
+        text: [
+          "A NomuPay payment failed.",
+          "",
+          `Payment ID: ${paymentId}`,
+          `Amount: ${amount} ${currency}`,
+          `Result Code: ${resultCode}`,
+          `Result Description: ${resultDescription}`,
+          "",
+          "Webhook Payload:",
+          JSON.stringify(webhook, null, 2)
+        ].join("\n")
       });
 
-      console.log("Alert email successfully sent");
+      console.log("Email sent successfully");
 
     } else {
-      console.log("Payment success detected, no email required");
+      console.log("Payment successful, no email sent");
     }
 
   } catch (error) {
 
     console.error("Webhook processing error:", error.message);
     console.error("Raw body:", rawBody);
-    console.error("Headers:", headers);
 
   }
 

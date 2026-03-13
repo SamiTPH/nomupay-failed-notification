@@ -2,14 +2,27 @@ import express from "express";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
 
+const APP_VERSION = "1.1.0"; // NEW: version marker to force git change
+
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Accept raw text payloads (NomuPay may send encrypted hex)
+console.log("Starting NomuPay webhook service v" + APP_VERSION);
+
+// Accept raw body
 app.use(express.text({ type: "*/*", limit: "2mb" }));
 
 /*
-SMTP EMAIL TRANSPORT
+ENVIRONMENT CHECK
+*/
+console.log("Environment variables check:");
+console.log("SMTP_HOST:", process.env.SMTP_HOST ? "OK" : "MISSING");
+console.log("SMTP_USER:", process.env.SMTP_USER ? "OK" : "MISSING");
+console.log("ALERT_EMAIL_TO:", process.env.ALERT_EMAIL_TO ? "OK" : "MISSING");
+console.log("WEBHOOK_SECRET_HEX:", process.env.WEBHOOK_SECRET_HEX ? "OK" : "MISSING");
+
+/*
+SMTP CONFIGURATION
 */
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
@@ -22,14 +35,22 @@ const transporter = nodemailer.createTransport({
 });
 
 /*
-DEDUPLICATION (memory)
+VERIFY SMTP CONNECTION
+*/
+transporter.verify()
+  .then(() => console.log("SMTP connection successful"))
+  .catch(err => console.error("SMTP connection failed:", err.message));
+
+/*
+IN MEMORY DEDUPE
 */
 const seen = new Set();
 
 /*
-AES DECRYPTION (NomuPay encrypted payloads)
+DECRYPT PAYLOAD
 */
 function decryptHexPayload(encryptedHex, secretHex, ivHex) {
+
   const key = Buffer.from(secretHex, "hex");
   const iv = Buffer.from(ivHex, "hex");
   const encrypted = Buffer.from(encryptedHex, "hex");
@@ -45,21 +66,15 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex) {
 }
 
 /*
-PARSE INCOMING WEBHOOK
-Handles:
-- JSON payload
-- encrypted payload wrapper
-- raw encrypted payload
+PARSE WEBHOOK
 */
 function parseIncomingWebhook(rawBody, headers) {
 
-  let bodyText = rawBody;
-
   try {
 
-    const parsed = JSON.parse(bodyText);
+    const parsed = JSON.parse(rawBody);
 
-    if (typeof parsed.payload === "object" && parsed.payload !== null) {
+    if (typeof parsed.payload === "object") {
       return parsed;
     }
 
@@ -97,7 +112,7 @@ function parseIncomingWebhook(rawBody, headers) {
     }
 
     const decrypted = decryptHexPayload(
-      bodyText.trim(),
+      rawBody.trim(),
       process.env.WEBHOOK_SECRET_HEX,
       ivHex
     );
@@ -107,7 +122,7 @@ function parseIncomingWebhook(rawBody, headers) {
 }
 
 /*
-SUCCESS RESULT CHECK
+CHECK SUCCESS RESULT
 */
 function isSuccessResult(code) {
   return typeof code === "string" && code.startsWith("000.");
@@ -117,7 +132,7 @@ function isSuccessResult(code) {
 HEALTH CHECK
 */
 app.get("/", (_req, res) => {
-  res.status(200).send("NomuPay webhook listener running");
+  res.status(200).send(`NomuPay webhook listener running v${APP_VERSION}`);
 });
 
 /*
@@ -134,28 +149,24 @@ app.post("/webhooks/nomupay", async (req, res) => {
     ])
   );
 
-  // Respond immediately so NomuPay doesn't retry
   res.status(200).send("OK");
 
   try {
 
     if (!process.env.WEBHOOK_SECRET_HEX) {
-      console.error("Missing WEBHOOK_SECRET_HEX");
+      console.error("WEBHOOK_SECRET_HEX not configured");
       return;
     }
 
-    console.log("=== RAW WEBHOOK BODY ===");
-    console.log(rawBody);
-
-    console.log("=== WEBHOOK HEADERS ===");
-    console.log(headers);
+    console.log("Incoming NomuPay webhook received");
 
     const webhook = parseIncomingWebhook(rawBody, headers);
 
-    console.log("=== DECRYPTED WEBHOOK ===");
+    console.log("Decrypted webhook payload:");
     console.log(JSON.stringify(webhook, null, 2));
 
     if (webhook?.type !== "PAYMENT" || !webhook?.payload) {
+      console.log("Webhook ignored (not payment event)");
       return;
     }
 
@@ -170,40 +181,37 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const dedupeKey = `${paymentId}:${resultCode}`;
 
     if (seen.has(dedupeKey)) {
-      console.log("Duplicate webhook ignored:", dedupeKey);
+      console.log("Duplicate webhook skipped:", dedupeKey);
       return;
     }
 
     seen.add(dedupeKey);
 
-    /*
-    SEND EMAIL IF PAYMENT FAILED
-    */
     if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
 
-      console.log("Payment failure detected → sending email");
+      console.log("Payment failure detected, sending alert email");
 
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
         subject: `NomuPay payment failed - ${paymentId}`,
-        text: [
-          "A NomuPay payment webhook indicates a non-success result.",
-          "",
-          `Payment ID: ${paymentId}`,
-          `Amount: ${amount} ${currency}`.trim(),
-          `Result Code: ${resultCode}`,
-          `Result Description: ${resultDescription}`,
-          "",
-          "Full Webhook:",
-          JSON.stringify(webhook, null, 2)
-        ].join("\n")
+        text: `
+Payment failure detected.
+
+Payment ID: ${paymentId}
+Amount: ${amount} ${currency}
+Result Code: ${resultCode}
+Description: ${resultDescription}
+
+Webhook Payload:
+${JSON.stringify(webhook, null, 2)}
+`
       });
 
-      console.log("Email sent successfully");
+      console.log("Alert email successfully sent");
 
     } else {
-      console.log("Payment success or email disabled");
+      console.log("Payment success detected, no email required");
     }
 
   } catch (error) {

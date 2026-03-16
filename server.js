@@ -7,7 +7,6 @@ const port = process.env.PORT || 3000;
 
 console.log("Starting NomuPay webhook listener");
 
-// accept encrypted hex body
 app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
@@ -39,7 +38,6 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
   const authTag = Buffer.from(authTagHex, "hex");
 
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
-
   decipher.setAuthTag(authTag);
 
   const decrypted = Buffer.concat([
@@ -78,7 +76,6 @@ app.post("/webhooks/nomupay", async (req, res) => {
     ])
   );
 
-  // acknowledge immediately
   res.status(200).send("OK");
 
   try {
@@ -120,6 +117,18 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const amount = payment.amount || "";
     const currency = payment.currency || "";
 
+    const merchantReference = payment.merchantTransactionId || "N/A";
+
+    const clientName = payment.card?.holder || "Unknown";
+    const clientPhone = payment.customer?.phone || "N/A";
+    const clientEmail = payment.customer?.email || "N/A";
+
+    const cardType = `${payment.paymentBrand || ""} ${payment.card?.type || ""}`.trim();
+    const last4 = payment.card?.last4Digits || "N/A";
+    const bank = payment.card?.issuer?.bank || "Unknown";
+
+    const timestamp = payment.timestamp || "";
+
     const dedupeKey = `${paymentId}:${resultCode}`;
 
     if (seen.has(dedupeKey)) {
@@ -136,21 +145,41 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
       console.log("Payment failure detected → sending email");
 
+      const emailBody = `
+A client payment attempt has failed and requires follow-up.
+
+CLIENT DETAILS
+Client Name: ${clientName}
+Phone: ${clientPhone}
+Email: ${clientEmail}
+
+Internal Reference
+${merchantReference}
+
+PAYMENT DETAILS
+Amount: ${amount} ${currency}
+Payment ID: ${paymentId}
+Date: ${timestamp}
+
+CARD INFORMATION
+Card Type: ${cardType}
+Last 4 Digits: ${last4}
+Bank: ${bank}
+
+FAILURE REASON
+${resultDescription}
+
+ACTION REQUIRED
+Please contact the client to retry the payment or arrange an alternative payment method.
+
+NomuPay Webhook Notification System
+`;
+
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
-        subject: `NomuPay payment failed - ${paymentId}`,
-        text: [
-          "A NomuPay payment failed.",
-          "",
-          `Payment ID: ${paymentId}`,
-          `Amount: ${amount} ${currency}`,
-          `Result Code: ${resultCode}`,
-          `Result Description: ${resultDescription}`,
-          "",
-          "Webhook Payload:",
-          JSON.stringify(webhook, null, 2)
-        ].join("\n")
+        subject: `⚠️ Payment Failed – Client Follow-Up Required`,
+        text: emailBody
       });
 
       console.log("Email sent successfully");
@@ -168,9 +197,6 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
 });
 
-/*
-START SERVER
-*/
 app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });

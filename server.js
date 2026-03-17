@@ -21,7 +21,9 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS
   }
 });
-
+transporter.verify()
+  .then(() => console.log("Resend SMTP connected"))
+  .catch(err => console.error("SMTP error:", err));
 /*
 DEDUPLICATION
 */

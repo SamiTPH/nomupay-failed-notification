@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
+import axios from "axios";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -10,7 +11,7 @@ console.log("Starting NomuPay webhook listener");
 app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
-EMAIL SETUP
+EMAIL SETUP (RESEND)
 */
 const transporter = nodemailer.createTransport({
   host: "smtp.resend.com",
@@ -21,9 +22,11 @@ const transporter = nodemailer.createTransport({
     pass: process.env.SMTP_PASS
   }
 });
+
 transporter.verify()
   .then(() => console.log("Resend SMTP connected"))
   .catch(err => console.error("SMTP error:", err));
+
 /*
 DEDUPLICATION
 */
@@ -55,6 +58,60 @@ SUCCESS CHECK
 */
 function isSuccessResult(code) {
   return typeof code === "string" && code.startsWith("000.");
+}
+
+/*
+GET MICROSOFT GRAPH TOKEN
+*/
+async function getGraphToken() {
+
+  const url = `https://login.microsoftonline.com/${process.env.MS_TENANT_ID}/oauth2/v2.0/token`;
+
+  const params = new URLSearchParams();
+
+  params.append("client_id", process.env.MS_CLIENT_ID);
+  params.append("client_secret", process.env.MS_CLIENT_SECRET);
+  params.append("scope", "https://graph.microsoft.com/.default");
+  params.append("grant_type", "client_credentials");
+
+  const res = await axios.post(url, params);
+
+  return res.data.access_token;
+}
+
+/*
+LOG FAILED PAYMENT TO EXCEL
+*/
+async function logFailedPayment(data) {
+
+  const token = await getGraphToken();
+
+  const url =
+`https://graph.microsoft.com/v1.0/users/sp_admin_tphgroup_me@tphgroup.me/drive/root:${process.env.EXCEL_FILE_PATH}:/workbook/tables/${process.env.EXCEL_TABLE_NAME}/rows/add`;
+
+  const body = {
+    values: [[
+      data.timestamp,
+      data.clientName,
+      data.clientEmail,
+      data.phone,
+      data.reference,
+      data.amount,
+      data.currency,
+      data.resultCode,
+      data.resultDescription,
+      data.paymentId
+    ]]
+  };
+
+  await axios.post(url, body, {
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    }
+  });
+
+  console.log("Excel row added");
 }
 
 /*
@@ -141,7 +198,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
     seen.add(dedupeKey);
 
     /*
-    EMAIL ALERT ON FAILURE
+    EMAIL + EXCEL LOG ON FAILURE
     */
     if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
 
@@ -186,8 +243,26 @@ NomuPay Webhook Notification System
 
       console.log("Email sent successfully");
 
+      /*
+      LOG TO EXCEL
+      */
+      await logFailedPayment({
+        timestamp,
+        clientName,
+        clientEmail,
+        phone: clientPhone,
+        reference: merchantReference,
+        amount,
+        currency,
+        resultCode,
+        resultDescription,
+        paymentId
+      });
+
     } else {
+
       console.log("Payment successful, no email sent");
+
     }
 
   } catch (error) {

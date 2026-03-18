@@ -11,20 +11,42 @@ console.log("Starting NomuPay webhook listener");
 app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
-EMAIL SETUP (RESEND)
+EMAIL PROVIDER SWITCH
 */
-const transporter = nodemailer.createTransport({
-  host: "smtp.resend.com",
-  port: 465,
-  secure: true,
-  auth: {
-    user: "resend",
-    pass: process.env.SMTP_PASS
-  }
-});
+let transporter;
+
+if (process.env.EMAIL_PROVIDER === "outlook") {
+
+  console.log("Using Outlook SMTP");
+
+  transporter = nodemailer.createTransport({
+    host: process.env.OUTLOOK_HOST,
+    port: Number(process.env.OUTLOOK_PORT),
+    secure: process.env.OUTLOOK_SECURE === "true",
+    auth: {
+      user: process.env.OUTLOOK_USER,
+      pass: process.env.OUTLOOK_PASS
+    }
+  });
+
+} else {
+
+  console.log("Using Resend SMTP");
+
+  transporter = nodemailer.createTransport({
+    host: process.env.RESEND_HOST,
+    port: Number(process.env.RESEND_PORT),
+    secure: process.env.RESEND_SECURE === "true",
+    auth: {
+      user: process.env.RESEND_USER,
+      pass: process.env.RESEND_PASS
+    }
+  });
+
+}
 
 transporter.verify()
-  .then(() => console.log("Resend SMTP connected"))
+  .then(() => console.log("SMTP connected"))
   .catch(err => console.error("SMTP error:", err));
 
 /*
@@ -33,7 +55,7 @@ DEDUPLICATION
 const seen = new Set();
 
 /*
-AES-256-GCM DECRYPTION
+AES DECRYPTION
 */
 function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
 
@@ -61,7 +83,7 @@ function isSuccessResult(code) {
 }
 
 /*
-GET MICROSOFT GRAPH TOKEN
+GET GRAPH TOKEN
 */
 async function getGraphToken() {
 
@@ -122,7 +144,7 @@ app.get("/", (_req, res) => {
 });
 
 /*
-WEBHOOK ENDPOINT
+WEBHOOK
 */
 app.post("/webhooks/nomupay", async (req, res) => {
 
@@ -139,18 +161,8 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
   try {
 
-    if (!process.env.WEBHOOK_SECRET_HEX) {
-      console.error("Missing WEBHOOK_SECRET_HEX");
-      return;
-    }
-
     const ivHex = headers["x-initialization-vector"];
     const authTagHex = headers["x-authentication-tag"];
-
-    if (!ivHex || !authTagHex) {
-      console.error("Missing encryption headers");
-      return;
-    }
 
     const decrypted = decryptHexPayload(
       rawBody.trim(),
@@ -164,9 +176,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
     console.log("=== DECRYPTED NOMUPAY WEBHOOK ===");
     console.log(JSON.stringify(webhook, null, 2));
 
-    if (webhook?.type !== "PAYMENT" || !webhook?.payload) {
-      return;
-    }
+    if (webhook?.type !== "PAYMENT" || !webhook?.payload) return;
 
     const payment = webhook.payload;
 
@@ -182,10 +192,6 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const clientPhone = payment.customer?.phone || "N/A";
     const clientEmail = payment.customer?.email || "N/A";
 
-    const cardType = `${payment.paymentBrand || ""} ${payment.card?.type || ""}`.trim();
-    const last4 = payment.card?.last4Digits || "N/A";
-    const bank = payment.card?.issuer?.bank || "Unknown";
-
     const timestamp = payment.timestamp || "";
 
     const dedupeKey = `${paymentId}:${resultCode}`;
@@ -197,10 +203,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
     seen.add(dedupeKey);
 
-    /*
-    EMAIL + EXCEL LOG ON FAILURE
-    */
-    if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
+    if (!isSuccessResult(resultCode)) {
 
       console.log("Payment failure detected → sending email");
 
@@ -212,40 +215,27 @@ Client Name: ${clientName}
 Phone: ${clientPhone}
 Email: ${clientEmail}
 
-Internal Reference
+Reference
 ${merchantReference}
 
-PAYMENT DETAILS
+PAYMENT
 Amount: ${amount} ${currency}
 Payment ID: ${paymentId}
 Date: ${timestamp}
 
-CARD INFORMATION
-Card Type: ${cardType}
-Last 4 Digits: ${last4}
-Bank: ${bank}
-
-FAILURE REASON
+FAILURE
 ${resultDescription}
-
-ACTION REQUIRED
-Please contact the client to retry the payment or arrange an alternative payment method.
-
-NomuPay Webhook Notification System
 `;
 
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
-        subject: `⚠️ Payment Failed – Client Follow-Up Required`,
+        subject: "⚠️ Payment Failed – Client Follow-Up Required",
         text: emailBody
       });
 
-      console.log("Email sent successfully");
+      console.log("Email sent");
 
-      /*
-      LOG TO EXCEL
-      */
       await logFailedPayment({
         timestamp,
         clientName,
@@ -261,14 +251,13 @@ NomuPay Webhook Notification System
 
     } else {
 
-      console.log("Payment successful, no email sent");
+      console.log("Payment successful");
 
     }
 
   } catch (error) {
 
     console.error("Webhook processing error:", error.message);
-    console.error("Raw body:", rawBody);
 
   }
 

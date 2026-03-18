@@ -34,12 +34,12 @@ if (process.env.EMAIL_PROVIDER === "outlook") {
   console.log("Using Resend SMTP");
 
   transporter = nodemailer.createTransport({
-    host: process.env.RESEND_HOST,
-    port: Number(process.env.RESEND_PORT),
-    secure: process.env.RESEND_SECURE === "true",
+    host: process.env.SMTP_HOST,
+    port: Number(process.env.SMTP_PORT),
+    secure: process.env.SMTP_SECURE === "true",
     auth: {
-      user: process.env.RESEND_USER,
-      pass: process.env.RESEND_PASS
+      user: process.env.SMTP_USER,
+      pass: process.env.SMTP_PASS
     }
   });
 
@@ -49,9 +49,6 @@ transporter.verify()
   .then(() => console.log("SMTP connected"))
   .catch(err => console.error("SMTP error:", err));
 
-/*
-DEDUPLICATION
-*/
 const seen = new Set();
 
 /*
@@ -83,7 +80,7 @@ function isSuccessResult(code) {
 }
 
 /*
-GET GRAPH TOKEN
+GRAPH TOKEN
 */
 async function getGraphToken() {
 
@@ -102,7 +99,7 @@ async function getGraphToken() {
 }
 
 /*
-LOG FAILED PAYMENT TO EXCEL
+EXCEL LOGGING
 */
 async function logFailedPayment(data) {
 
@@ -137,7 +134,7 @@ async function logFailedPayment(data) {
 }
 
 /*
-HEALTH CHECK
+HEALTH
 */
 app.get("/", (_req, res) => {
   res.status(200).send("NomuPay webhook service running");
@@ -173,9 +170,6 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
     const webhook = JSON.parse(decrypted);
 
-    console.log("=== DECRYPTED NOMUPAY WEBHOOK ===");
-    console.log(JSON.stringify(webhook, null, 2));
-
     if (webhook?.type !== "PAYMENT" || !webhook?.payload) return;
 
     const payment = webhook.payload;
@@ -196,35 +190,24 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
     const dedupeKey = `${paymentId}:${resultCode}`;
 
-    if (seen.has(dedupeKey)) {
-      console.log("Duplicate webhook ignored:", dedupeKey);
-      return;
-    }
+    if (seen.has(dedupeKey)) return;
 
     seen.add(dedupeKey);
 
     if (!isSuccessResult(resultCode)) {
 
-      console.log("Payment failure detected → sending email");
-
       const emailBody = `
-A client payment attempt has failed and requires follow-up.
+Client payment failed.
 
-CLIENT DETAILS
-Client Name: ${clientName}
+Client: ${clientName}
 Phone: ${clientPhone}
 Email: ${clientEmail}
 
-Reference
-${merchantReference}
+Reference: ${merchantReference}
 
-PAYMENT
 Amount: ${amount} ${currency}
-Payment ID: ${paymentId}
-Date: ${timestamp}
 
-FAILURE
-${resultDescription}
+Reason: ${resultDescription}
 `;
 
       await transporter.sendMail({
@@ -233,8 +216,6 @@ ${resultDescription}
         subject: "⚠️ Payment Failed – Client Follow-Up Required",
         text: emailBody
       });
-
-      console.log("Email sent");
 
       await logFailedPayment({
         timestamp,
@@ -248,10 +229,6 @@ ${resultDescription}
         resultDescription,
         paymentId
       });
-
-    } else {
-
-      console.log("Payment successful");
 
     }
 

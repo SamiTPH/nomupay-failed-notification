@@ -11,21 +11,26 @@ console.log("Starting NomuPay webhook listener");
 app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
-EMAIL SETUP (OUTLOOK)
+EMAIL SETUP (RESEND)
 */
 const transporter = nodemailer.createTransport({
-  host: process.env.SMTP_HOST,
-  port: Number(process.env.SMTP_PORT || 587),
-  secure: false,
-  requireTLS: true,
+  host: process.env.SMTP_HOST,           // smtp.resend.com
+  port: Number(process.env.SMTP_PORT || 465),
+
+  // Resend uses SSL (port 465)
+  secure: true,
+
   auth: {
-    user: process.env.SMTP_USER,
-    pass: process.env.SMTP_PASS
+    user: process.env.SMTP_USER,         // "resend"
+    pass: process.env.SMTP_PASS          // API key
   }
 });
 
+/*
+VERIFY CONNECTION
+*/
 transporter.verify()
-  .then(() => console.log("SMTP connected successfully"))
+  .then(() => console.log("Resend SMTP connected successfully"))
   .catch(err => console.error("SMTP error:", err));
 
 /*
@@ -60,7 +65,7 @@ async function logFailedPayment(data) {
     const token = await getGraphToken();
 
     const url =
-      `https://graph.microsoft.com/v1.0/users/${process.env.EXCEL_USER}/drive/root:${process.env.EXCEL_FILE_PATH}:/workbook/tables/${process.env.EXCEL_TABLE_NAME}/rows/add`;
+`https://graph.microsoft.com/v1.0/users/${process.env.EXCEL_USER}/drive/root:${process.env.EXCEL_FILE_PATH}:/workbook/tables/${process.env.EXCEL_TABLE_NAME}/rows/add`;
 
     const body = {
       values: [[
@@ -228,7 +233,6 @@ ACTION REQUIRED
 Please contact the client to retry the payment.
 
 TRACKING SHEET
-You can track and update this case here:
 ${process.env.EXCEL_SHEET_LINK}
 
 NomuPay Webhook Notification System
@@ -243,7 +247,7 @@ NomuPay Webhook Notification System
 
       console.log("Email sent successfully");
 
-      // ✅ LOG TO EXCEL
+      // LOG TO EXCEL
       await logFailedPayment({
         timestamp,
         clientName,

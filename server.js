@@ -1,6 +1,7 @@
 import express from "express";
 import crypto from "crypto";
 import nodemailer from "nodemailer";
+import axios from "axios";
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -10,25 +11,19 @@ console.log("Starting NomuPay webhook listener");
 app.use(express.text({ type: "*/*", limit: "5mb" }));
 
 /*
-EMAIL SETUP (UPDATED FOR OUTLOOK)
+EMAIL SETUP (OUTLOOK)
 */
 const transporter = nodemailer.createTransport({
   host: process.env.SMTP_HOST,
   port: Number(process.env.SMTP_PORT || 587),
-
-  // IMPORTANT: must be false for port 587 (STARTTLS)
   secure: false,
-
-  // FORCE TLS UPGRADE (important for Outlook)
   requireTLS: true,
-
   auth: {
     user: process.env.SMTP_USER,
     pass: process.env.SMTP_PASS
   }
 });
 
-// Optional but VERY useful for debugging
 transporter.verify()
   .then(() => console.log("SMTP connected successfully"))
   .catch(err => console.error("SMTP error:", err));
@@ -37,6 +32,64 @@ transporter.verify()
 DEDUPLICATION
 */
 const seen = new Set();
+
+/*
+GET MICROSOFT GRAPH TOKEN
+*/
+async function getGraphToken() {
+
+  const url = `https://login.microsoftonline.com/${process.env.MS_TENANT_ID}/oauth2/v2.0/token`;
+
+  const params = new URLSearchParams();
+  params.append("client_id", process.env.MS_CLIENT_ID);
+  params.append("client_secret", process.env.MS_CLIENT_SECRET);
+  params.append("scope", "https://graph.microsoft.com/.default");
+  params.append("grant_type", "client_credentials");
+
+  const res = await axios.post(url, params);
+
+  return res.data.access_token;
+}
+
+/*
+LOG FAILED PAYMENT TO EXCEL
+*/
+async function logFailedPayment(data) {
+
+  try {
+    const token = await getGraphToken();
+
+    const url =
+      `https://graph.microsoft.com/v1.0/users/${process.env.EXCEL_USER}/drive/root:${process.env.EXCEL_FILE_PATH}:/workbook/tables/${process.env.EXCEL_TABLE_NAME}/rows/add`;
+
+    const body = {
+      values: [[
+        data.timestamp,
+        data.clientName,
+        data.reference,
+        data.phone,
+        data.email,
+        data.amount,
+        data.currency,
+        data.resultCode,
+        data.resultDescription,
+        data.paymentId
+      ]]
+    };
+
+    await axios.post(url, body, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json"
+      }
+    });
+
+    console.log("Excel row added successfully");
+
+  } catch (err) {
+    console.error("Excel logging failed:", err.response?.data || err.message);
+  }
+}
 
 /*
 AES-256-GCM DECRYPTION
@@ -134,10 +187,6 @@ app.post("/webhooks/nomupay", async (req, res) => {
     const clientPhone = payment.customer?.phone || "N/A";
     const clientEmail = payment.customer?.email || "N/A";
 
-    const cardType = `${payment.paymentBrand || ""} ${payment.card?.type || ""}`.trim();
-    const last4 = payment.card?.last4Digits || "N/A";
-    const bank = payment.card?.issuer?.bank || "Unknown";
-
     const timestamp = payment.timestamp || "";
 
     const dedupeKey = `${paymentId}:${resultCode}`;
@@ -150,7 +199,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
     seen.add(dedupeKey);
 
     /*
-    EMAIL ALERT ON FAILURE
+    EMAIL + EXCEL ON FAILURE
     */
     if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
 
@@ -164,7 +213,7 @@ Client Name: ${clientName}
 Phone: ${clientPhone}
 Email: ${clientEmail}
 
-Internal Reference
+Reference
 ${merchantReference}
 
 PAYMENT DETAILS
@@ -172,16 +221,15 @@ Amount: ${amount} ${currency}
 Payment ID: ${paymentId}
 Date: ${timestamp}
 
-CARD INFORMATION
-Card Type: ${cardType}
-Last 4 Digits: ${last4}
-Bank: ${bank}
-
 FAILURE REASON
 ${resultDescription}
 
 ACTION REQUIRED
-Please contact the client to retry the payment or arrange an alternative payment method.
+Please contact the client to retry the payment.
+
+TRACKING SHEET
+You can track and update this case here:
+${process.env.EXCEL_SHEET_LINK}
 
 NomuPay Webhook Notification System
 `;
@@ -189,27 +237,39 @@ NomuPay Webhook Notification System
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
-        subject: `⚠️ Payment Failed – Client Follow-Up Required`,
+        subject: `⚠️ Payment Failed – Action Required`,
         text: emailBody
       });
 
       console.log("Email sent successfully");
+
+      // ✅ LOG TO EXCEL
+      await logFailedPayment({
+        timestamp,
+        clientName,
+        reference: merchantReference,
+        phone: clientPhone,
+        email: clientEmail,
+        amount,
+        currency,
+        resultCode,
+        resultDescription,
+        paymentId
+      });
 
     } else {
       console.log("Payment successful, no email sent");
     }
 
   } catch (error) {
-
     console.error("Webhook processing error:", error.message);
     console.error("Raw body:", rawBody);
-
   }
 
 });
 
 /*
-FIX FOR RAILWAY (CRITICAL)
+FIX FOR RAILWAY
 */
 app.listen(port, "0.0.0.0", () => {
   console.log(`Server listening on port ${port}`);

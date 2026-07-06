@@ -5,6 +5,9 @@ import axios from "axios";
 
 const app = express();
 const port = process.env.PORT || 3000;
+const paymentSuccessWebhookUrl =
+  process.env.PAYMENT_SUCCESS_WEBHOOK_URL ||
+  "https://sancqfnrbodhlzsqqevb.supabase.co/functions/v1/stg-on-payment-success";
 
 console.log("Starting NomuPay webhook listener");
 
@@ -54,6 +57,37 @@ async function getGraphToken() {
   const res = await axios.post(url, params);
 
   return res.data.access_token;
+}
+
+/*
+PAYMENT DATA EXTRACTION
+*/
+function extractPaymentDetails(payment) {
+
+  const customerName = [
+    payment.customer?.givenName,
+    payment.customer?.surname
+  ].filter(Boolean).join(" ");
+
+  return {
+    timestamp: payment.timestamp || "",
+    clientName: payment.card?.holder || customerName || "Unknown",
+    reference: payment.merchantTransactionId || "N/A",
+    phone: payment.customer?.phone || payment.customer?.mobile || "N/A",
+    email: payment.customer?.email || "N/A",
+    amount: payment.amount || payment.presentationAmount || "",
+    currency: payment.currency || payment.presentationCurrency || "",
+    resultCode: payment.result?.code || "",
+    resultDescription: payment.result?.description || "",
+    paymentId: payment.id || "unknown",
+    paymentBrand: payment.paymentBrand || "",
+    paymentType: payment.paymentType || "",
+    paymentMethod: payment.paymentMethod || "",
+    shortId: payment.shortId || "",
+    descriptor: payment.descriptor || "",
+    ndc: payment.ndc || "",
+    cardLast4Digits: payment.card?.last4Digits || ""
+  };
 }
 
 /*
@@ -118,10 +152,85 @@ function decryptHexPayload(encryptedHex, secretHex, ivHex, authTagHex) {
 }
 
 /*
-SUCCESS CHECK
+PAYMENT RESULT CLASSIFICATION
 */
-function isSuccessResult(code) {
-  return typeof code === "string" && code.startsWith("000.");
+function getPaymentResultStatus(code) {
+
+  if (typeof code !== "string") {
+    return "failure";
+  }
+
+  const successfulPaymentPatterns = [
+    /^000\.000\./,
+    /^000\.100\.1/,
+    /^000\.[36]/,
+    /^000\.400\.[1][12]0/,
+    /^000\.400\.0[^3]/,
+    /^000\.400\.100/
+  ];
+
+  const pendingPaymentPatterns = [
+    /^000\.200/,
+    /^800\.400\.5/,
+    /^100\.400\.500/
+  ];
+
+  if (successfulPaymentPatterns.some(pattern => pattern.test(code))) {
+    return "success";
+  }
+
+  if (pendingPaymentPatterns.some(pattern => pattern.test(code))) {
+    return "pending";
+  }
+
+  return "failure";
+}
+
+/*
+SEND SUCCESSFUL PAYMENT TO ERP WEBHOOK
+*/
+async function pushSuccessfulPaymentToErp(data) {
+
+  try {
+    const headers = {
+      "Content-Type": "application/json"
+    };
+
+    if (process.env.PAYMENT_SUCCESS_WEBHOOK_AUTH_TOKEN) {
+      headers.Authorization = `Bearer ${process.env.PAYMENT_SUCCESS_WEBHOOK_AUTH_TOKEN}`;
+    }
+
+    const body = {
+      event: "payment_success",
+      timestamp: data.timestamp,
+      clientName: data.clientName,
+      reference: data.reference,
+      phone: data.phone,
+      email: data.email,
+      amount: data.amount,
+      currency: data.currency,
+      resultCode: data.resultCode,
+      resultDescription: data.resultDescription,
+      paymentId: data.paymentId,
+      paymentBrand: data.paymentBrand,
+      paymentType: data.paymentType,
+      paymentMethod: data.paymentMethod,
+      shortId: data.shortId,
+      descriptor: data.descriptor,
+      ndc: data.ndc,
+      cardLast4Digits: data.cardLast4Digits
+    };
+
+    const erpRes = await axios.post(paymentSuccessWebhookUrl, body, {
+      headers,
+      timeout: 15000
+    });
+
+    console.log("Successful payment pushed to ERP webhook:", erpRes.status);
+
+  } catch (err) {
+    console.error("ERP webhook push failed:", err.response?.data || err.message);
+  }
 }
 
 /*
@@ -179,22 +288,9 @@ app.post("/webhooks/nomupay", async (req, res) => {
     }
 
     const payment = webhook.payload;
+    const paymentDetails = extractPaymentDetails(payment);
 
-    const paymentId = payment.id || "unknown";
-    const resultCode = payment.result?.code || "";
-    const resultDescription = payment.result?.description || "";
-    const amount = payment.amount || "";
-    const currency = payment.currency || "";
-
-    const merchantReference = payment.merchantTransactionId || "N/A";
-
-    const clientName = payment.card?.holder || "Unknown";
-    const clientPhone = payment.customer?.phone || "N/A";
-    const clientEmail = payment.customer?.email || "N/A";
-
-    const timestamp = payment.timestamp || "";
-
-    const dedupeKey = `${paymentId}:${resultCode}`;
+    const dedupeKey = `${paymentDetails.paymentId}:${paymentDetails.resultCode}`;
 
     if (seen.has(dedupeKey)) {
       console.log("Duplicate webhook ignored:", dedupeKey);
@@ -203,31 +299,44 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
     seen.add(dedupeKey);
 
+    const paymentStatus = getPaymentResultStatus(paymentDetails.resultCode);
+
+    if (paymentStatus === "success") {
+      console.log("Successful payment detected -> pushing to ERP webhook");
+      await pushSuccessfulPaymentToErp(paymentDetails);
+      return;
+    }
+
+    if (paymentStatus === "pending") {
+      console.log("Payment pending, no failure alert or ERP push sent");
+      return;
+    }
+
     /*
     EMAIL + EXCEL ON FAILURE
     */
-    if (!isSuccessResult(resultCode) && process.env.ALERT_EMAIL_TO) {
+    if (process.env.ALERT_EMAIL_TO) {
 
-      console.log("Payment failure detected → sending email");
+      console.log("Payment failure detected -> sending email");
 
       const emailBody = `
 A client payment attempt has failed and requires follow-up.
 
 CLIENT DETAILS
-Client Name: ${clientName}
-Phone: ${clientPhone}
-Email: ${clientEmail}
+Client Name: ${paymentDetails.clientName}
+Phone: ${paymentDetails.phone}
+Email: ${paymentDetails.email}
 
 Reference
-${merchantReference}
+${paymentDetails.reference}
 
 PAYMENT DETAILS
-Amount: ${amount} ${currency}
-Payment ID: ${paymentId}
-Date: ${timestamp}
+Amount: ${paymentDetails.amount} ${paymentDetails.currency}
+Payment ID: ${paymentDetails.paymentId}
+Date: ${paymentDetails.timestamp}
 
 FAILURE REASON
-${resultDescription}
+${paymentDetails.resultDescription}
 
 ACTION REQUIRED
 Please contact the client to retry the payment.
@@ -241,28 +350,17 @@ NomuPay Webhook Notification System
       await transporter.sendMail({
         from: process.env.ALERT_EMAIL_FROM,
         to: process.env.ALERT_EMAIL_TO,
-        subject: `⚠️ Payment Failed – Action Required`,
+        subject: "Payment Failed - Action Required",
         text: emailBody
       });
 
       console.log("Email sent successfully");
 
       // LOG TO EXCEL
-      await logFailedPayment({
-        timestamp,
-        clientName,
-        reference: merchantReference,
-        phone: clientPhone,
-        email: clientEmail,
-        amount,
-        currency,
-        resultCode,
-        resultDescription,
-        paymentId
-      });
+      await logFailedPayment(paymentDetails);
 
     } else {
-      console.log("Payment successful, no email sent");
+      console.log("Payment failure detected, but ALERT_EMAIL_TO is not configured");
     }
 
   } catch (error) {

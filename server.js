@@ -5,7 +5,8 @@ import axios from "axios";
 
 const app = express();
 const port = process.env.PORT || 3000;
-const paymentSuccessWebhookUrl =
+const erpPaymentWebhookUrl =
+  process.env.ERP_PAYMENT_WEBHOOK_URL ||
   process.env.PAYMENT_SUCCESS_WEBHOOK_URL ||
   "https://sancqfnrbodhlzsqqevb.supabase.co/functions/v1/stg-on-payment-success";
 
@@ -187,21 +188,26 @@ function getPaymentResultStatus(code) {
 }
 
 /*
-SEND SUCCESSFUL PAYMENT TO ERP WEBHOOK
+SEND FINAL PAYMENT RESULT TO ERP WEBHOOK
 */
-async function pushSuccessfulPaymentToErp(data) {
+async function pushPaymentToErp(data, status) {
 
   try {
     const headers = {
       "Content-Type": "application/json"
     };
 
-    if (process.env.PAYMENT_SUCCESS_WEBHOOK_AUTH_TOKEN) {
-      headers.Authorization = `Bearer ${process.env.PAYMENT_SUCCESS_WEBHOOK_AUTH_TOKEN}`;
+    const authToken =
+      process.env.ERP_PAYMENT_WEBHOOK_AUTH_TOKEN ||
+      process.env.PAYMENT_SUCCESS_WEBHOOK_AUTH_TOKEN;
+
+    if (authToken) {
+      headers.Authorization = `Bearer ${authToken}`;
     }
 
     const body = {
-      event: "payment_success",
+      event: status === "success" ? "payment_success" : "payment_failure",
+      status,
       timestamp: data.timestamp,
       clientName: data.clientName,
       reference: data.reference,
@@ -221,15 +227,21 @@ async function pushSuccessfulPaymentToErp(data) {
       cardLast4Digits: data.cardLast4Digits
     };
 
-    const erpRes = await axios.post(paymentSuccessWebhookUrl, body, {
+    const erpRes = await axios.post(erpPaymentWebhookUrl, body, {
       headers,
       timeout: 15000
     });
 
-    console.log("Successful payment pushed to ERP webhook:", erpRes.status);
+    console.log(
+      `${status === "success" ? "Successful" : "Failed"} payment pushed to ERP webhook:`,
+      erpRes.status
+    );
 
   } catch (err) {
-    console.error("ERP webhook push failed:", err.response?.data || err.message);
+    console.error(
+      `ERP webhook push failed for ${status} payment:`,
+      err.response?.data || err.message
+    );
   }
 }
 
@@ -303,7 +315,7 @@ app.post("/webhooks/nomupay", async (req, res) => {
 
     if (paymentStatus === "success") {
       console.log("Successful payment detected -> pushing to ERP webhook");
-      await pushSuccessfulPaymentToErp(paymentDetails);
+      await pushPaymentToErp(paymentDetails, paymentStatus);
       return;
     }
 
@@ -311,6 +323,9 @@ app.post("/webhooks/nomupay", async (req, res) => {
       console.log("Payment pending, no failure alert or ERP push sent");
       return;
     }
+
+    console.log("Failed payment detected -> pushing to ERP webhook");
+    await pushPaymentToErp(paymentDetails, paymentStatus);
 
     /*
     EMAIL + EXCEL ON FAILURE
